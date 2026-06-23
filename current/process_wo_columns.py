@@ -59,37 +59,54 @@ def _read_excel(path: str, sheet: str) -> pd.DataFrame:
         return pd.read_excel(path, sheet_name=sheet, engine="openpyxl")
 
 
+# Max allowed total hours (in minutes) per shift category
+_SHIFT_MAX_MINS: dict[str, int] = {
+    "AS": 8 * 60 + 10,   # 8h 10m
+    "BS": 8 * 60 + 10,   # 8h 10m
+    "CS": 8 * 60 + 10,   # 8h 10m
+    "GS": 8 * 60 + 35,   # 8h 35m
+}
+
+
 def generate_synthetic_timing(shift_code: str) -> dict[str, str]:
-    """Generate realistic In/Out/Hrs punches for a given shift with variance matching user examples."""
+    """Generate realistic In/Out/Hrs punches for a given shift.
+
+    Start time varies randomly up to 10 min early from base start.
+    Total hours are capped at 8:10 for AS/BS/CS and 8:35 for GS.
+    Extra minutes (2..cap_headroom) are split between early arrival and late departure.
+    """
     sc = shift_code.upper()
-    
+
     # Base times in minutes past midnight (start, end)
     base_times = {
-        "AS": (6 * 60, 14 * 60),             # 6:00 AM to 2:00 PM (8h)
-        "BS": (14 * 60, 22 * 60),            # 2:00 PM to 10:00 PM (8h)
-        "CS": (22 * 60, 6 * 60 + 24 * 60),   # 10:00 PM to 6:00 AM (8h)
-        "GS": (9 * 60, 17 * 60 + 30),        # 9:00 AM to 5:30 PM (8h 30m)
+        "AS": (6 * 60, 14 * 60),            # 6:00 AM to 2:00 PM (8h)
+        "BS": (14 * 60, 22 * 60),           # 2:00 PM to 10:00 PM (8h)
+        "CS": (22 * 60, 6 * 60 + 24 * 60),  # 10:00 PM to 6:00 AM (8h)
+        "GS": (9 * 60, 17 * 60 + 30),       # 9:00 AM to 5:30 PM (8h 30m)
     }
-    
+
     if sc not in base_times:
         return {}
-        
+
     base_start, base_end = base_times[sc]
     base_duration = base_end - base_start
-    
-    # Generate 2 to 10 extra minutes above the base duration
-    extra_mins = random.randint(2, 10)
-    
-    # Randomly distribute the extra minutes between arriving early and leaving late
-    early_mins = random.randint(0, extra_mins)
+    max_duration = _SHIFT_MAX_MINS[sc]
+    max_extra = max_duration - base_duration  # headroom before hitting the cap
+
+    # Extra minutes are at least 2 and at most the cap headroom (e.g. 10 for ABC, 5 for GS)
+    extra_mins = random.randint(2, max(2, max_extra))
+    extra_mins = min(extra_mins, max_extra)  # hard cap
+
+    # Randomly distribute between arriving early and leaving late
+    # Start can be up to 10 min early (but not more than extra_mins)
+    early_mins = random.randint(0, min(extra_mins, 10))
     late_mins = extra_mins - early_mins
-    
+
     in_punch_mins = base_start - early_mins
     out_punch_mins = base_end + late_mins
-    duration_mins = base_duration + extra_mins
-    
+    duration_mins = base_duration + extra_mins  # guaranteed <= max_duration
+
     def format_time(mins: int) -> str:
-        # Normalize to 24 hour clock string formatting
         m = mins % (24 * 60)
         hours = m // 60
         minutes = m % 60
@@ -98,7 +115,7 @@ def generate_synthetic_timing(shift_code: str) -> dict[str, str]:
     return {
         "first_in": format_time(in_punch_mins),
         "last_out": format_time(out_punch_mins),
-        "hrs": format_time(duration_mins)
+        "hrs": format_time(duration_mins),
     }
 
 
@@ -125,7 +142,6 @@ def add_new_timing_columns(
     nh = df[hrs_col].copy()
 
     for i in range(len(df)):
-        shift = df.at[i, "Shift"]
         nw = df.at[i, "New_WO"]
 
         s_nw = str(nw).strip() if pd.notna(nw) else ""
@@ -133,10 +149,9 @@ def add_new_timing_columns(
             continue
 
         assigned = s_nw.upper()
-        orig_shift = str(shift).strip().upper() if pd.notna(shift) else ""
-        
-        # Apply synthetic times only if assigned a main shift AND it differs from the original
-        if assigned in ("AS", "BS", "CS", "GS") and orig_shift != assigned:
+
+        # Always apply capped synthetic timing for any valid shift assignment
+        if assigned in ("AS", "BS", "CS", "GS"):
             syn = generate_synthetic_timing(assigned)
             if syn:
                 nfi.iloc[i] = syn["first_in"]
@@ -188,10 +203,21 @@ def is_source_wo(duty: object, shift: object = None) -> bool:
     return False
 
 
+def is_compound_duty(duty: object) -> bool:
+    """Return True if Duty Status is a slash-compound value like SL/P, P/HD, CL/P, etc.
+
+    These rows should keep their original Shift in New_WO (not marked Absent,
+    not reassigned to the weekly mode shift).
+    """
+    if pd.isna(duty):
+        return False
+    return "/" in str(duty).strip()
+
+
 def is_absence_display(
     duty: object, *, is_calculated_wo: bool, is_legacy_wo: bool
 ) -> bool:
-    """Non-Present leave types -> show 'Absent' in New_WO (unless skip/cal WO)."""
+    """Non-Present leave types -> show 'Absent' in New_WO (unless skip/cal WO/compound duty)."""
     if is_calculated_wo:
         return False
     if is_legacy_wo:
@@ -202,6 +228,9 @@ def is_absence_display(
     if u in ("PRESENT", "OD"):
         return False
     if u == "WO":
+        return False
+    # Slash-compound statuses (e.g. SL/P, P/HD) are handled separately
+    if "/" in u:
         return False
     return True
 
@@ -340,7 +369,12 @@ def build_wo_columns(df: pd.DataFrame) -> pd.DataFrame:
                 if should_skip_shift(shift, remarks, duty):
                     new_wo[row_idx] = _normalize_shift(shift) or ""
                     continue
-                
+
+                # Slash-compound Duty Status (e.g. SL/P, P/HD, CL/P) -> keep original Shift
+                if is_compound_duty(duty):
+                    new_wo[row_idx] = _normalize_shift(shift) or ""
+                    continue
+
                 if is_absence_display(duty, is_calculated_wo=cwo, is_legacy_wo=legacy_wo):
                     new_wo[row_idx] = "Absent"
                     continue
